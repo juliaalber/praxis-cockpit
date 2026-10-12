@@ -281,7 +281,15 @@ async function pbkdf2Key(pw,salt){const base=await crypto.subtle.importKey("raw"
 async function newMasterKey(){return crypto.subtle.generateKey({name:"AES-GCM",length:256},true,["encrypt","decrypt"]);}
 async function wrapMK(mk,wk){const iv=crypto.getRandomValues(new Uint8Array(12));const w=await crypto.subtle.wrapKey("raw",mk,wk,{name:"AES-GCM",iv});return{iv:b64(iv),w:b64(w)};}
 async function unwrapMK(rec,wk){return crypto.subtle.unwrapKey("raw",unb64(rec.w),wk,{name:"AES-GCM",iv:unb64(rec.iv)},{name:"AES-GCM",length:256},true,["encrypt","decrypt"]);}
-async function encWithMK(obj){const iv=crypto.getRandomValues(new Uint8Array(12));const ct=await crypto.subtle.encrypt({name:"AES-GCM",iv},MK,enc.encode(JSON.stringify(obj)));return{iv:b64(iv),ct:b64(ct)};}
+/* Serialisiert sicher: lässt versehentliche Kreis-Verweise weg, damit Speichern nie abstürzt (MDN-Muster). */
+function safeStringify(obj){const ancestors=[];
+  return JSON.stringify(obj,function(key,value){
+    if(typeof value!=="object"||value===null)return value;
+    while(ancestors.length>0&&ancestors[ancestors.length-1]!==this)ancestors.pop();
+    if(ancestors.includes(value))return undefined; // Kreis-Verweis wird weggelassen
+    ancestors.push(value);return value;});}
+function safeClone(obj){return JSON.parse(safeStringify(obj));}
+async function encWithMK(obj){const iv=crypto.getRandomValues(new Uint8Array(12));const ct=await crypto.subtle.encrypt({name:"AES-GCM",iv},MK,enc.encode(safeStringify(obj)));return{iv:b64(iv),ct:b64(ct)};}
 async function decWithMK(rec){const pt=await crypto.subtle.decrypt({name:"AES-GCM",iv:unb64(rec.iv)},MK,unb64(rec.ct));return JSON.parse(dec.decode(pt));}
 async function encBlob(blob){const buf=await blob.arrayBuffer();const iv=crypto.getRandomValues(new Uint8Array(12));
   const ct=await crypto.subtle.encrypt({name:"AES-GCM",iv},MK,buf);return{iv:b64(iv),ct:b64(ct),type:blob.type||"application/octet-stream"};}
@@ -1831,10 +1839,11 @@ function renderSettings(){
       <p class="hint" style="margin:0 0 12px">Lade regelmäßig eine Komplettsicherung herunter — eine Datei mit allem, inklusive Fotos. Damit bist du unabhängig vom Browser und kannst alles jederzeit wiederherstellen. ${anzahl} Klient:innen gespeichert.</p>
       <div class="rowbtns">
         <button class="btn-primary" onclick="exportKomplett()">⬇ Komplettsicherung herunterladen (mit Fotos)</button>
+        <button class="btn-primary" onclick="exportKomplettVerschluesselt()">🔒 Verschlüsselte Sicherung (mit Passwort)</button>
         <button class="btn-ghost btn-sm" onclick="document.getElementById('impTop').click()">Aus Sicherung wiederherstellen</button>
         <input id="impTop" type="file" accept="application/json,.pcbackup,.zip" class="hidden" onchange="importJson(event)">
       </div>
-      <p class="hint" style="margin:12px 0 0">Die Datei heißt <b>praxis-cockpit-komplett-…​.pcbackup</b> und landet in deinem Download-Ordner. Bewahr sie an einem sicheren, privaten Ort auf.</p>
+      <p class="hint" style="margin:12px 0 0">Zwei Sicherungen: Die <b>normale</b> ist unverschlüsselt — gut für einen sicheren Ort bei dir (USB-Stick, zweite Festplatte). Die <b>verschlüsselte</b> ist mit deinem Passwort geschützt und darf auch in einen Cloud-Speicher wie Dropbox. Beide heißen <b>…​.pcbackup</b> und landen im Download-Ordner.</p>
     </div></div>
     <p style="color:var(--ink-soft);font-size:14px;margin-bottom:6px">Weitere Einstellungen — Tipp auf einen Balken klappt ihn auf, mit den Pfeilen änderst du die Reihenfolge.</p>
     <div id="setBlocks">${order.map((key,i)=>settingsBlock(key,i,order.length)).join("")}</div>`;
@@ -1976,7 +1985,7 @@ async function showRecoveryAgain(){const code=genRecovery();const cfg=await txGe
   cfg.recSalt=b64(s);cfg.wrapRec=await wrapMK(MK,await pbkdf2Key(code,s));await txSet("kv","config",cfg);
   $("#lock").classList.remove("hidden");$("#app").classList.add("hidden");
   showRecovery(code,()=>{$("#lock").classList.add("hidden");$("#app").classList.remove("hidden");renderSettings();});}
-function exportJson(){const clean=structuredClone(STATE);clean.klienten.forEach(k=>(k.sessions||[]).forEach(s=>delete s._open));
+function exportJson(){const clean=safeClone(STATE);clean.klienten.forEach(k=>(k.sessions||[]).forEach(s=>delete s._open));
   delete clean.__files;
   const blob=new Blob([JSON.stringify(clean,null,2)],{type:"application/json"});
   const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="praxis-cockpit-texte.json";a.click();
@@ -1988,28 +1997,54 @@ function alleFileIds(){const ids=new Set();
   if(STATE.settings.praxis&&STATE.settings.praxis.logoFid)ids.add(STATE.settings.praxis.logoFid);
   if(STATE.settings.willkommen&&STATE.settings.willkommen.fid)ids.add(STATE.settings.willkommen.fid);
   return [...ids];}
+/* sammelt STATE + alle Dateien als ein Objekt (für beide Sicherungsarten) */
+async function sammleKomplett(){
+  const clean=safeClone(STATE);clean.klienten.forEach(k=>(k.sessions||[]).forEach(s=>delete s._open));
+  const ids=alleFileIds();const files={};
+  for(const fid of ids){try{const blob=await getFileBlob(fid);if(blob){
+    const dataUrl=await blobToDataUrl(blob);files[fid]={type:blob.type||"application/octet-stream",data:dataUrl};}}catch(e){}}
+  clean.__files=files;clean.__komplett=true;return {clean,anzahlDateien:ids.length};}
+function ladeHerunter(text,name){const blob=new Blob([text],{type:"application/json"});
+  const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=name;a.click();}
 async function exportKomplett(){toast("Sammle Fotos und Dateien …");
-  try{
-    const clean=structuredClone(STATE);clean.klienten.forEach(k=>(k.sessions||[]).forEach(s=>delete s._open));
-    const ids=alleFileIds();const files={};
-    for(const fid of ids){try{const blob=await getFileBlob(fid);if(blob){
-      const dataUrl=await blobToDataUrl(blob);files[fid]={type:blob.type||"application/octet-stream",data:dataUrl};}}catch(e){}}
-    clean.__files=files;clean.__komplett=true;
-    const blob=new Blob([JSON.stringify(clean)],{type:"application/json"});
-    const a=document.createElement("a");a.href=URL.createObjectURL(blob);
-    a.download="praxis-cockpit-komplett-"+today()+".pcbackup";a.click();
-    toast(`Komplettsicherung gespeichert (${STATE.klienten.length} Klient:innen, ${ids.length} Dateien).`);
+  try{const {clean,anzahlDateien}=await sammleKomplett();
+    ladeHerunter(JSON.stringify(clean),"praxis-cockpit-komplett-"+today()+".pcbackup");
+    toast(`Komplettsicherung gespeichert (${STATE.klienten.length} Klient:innen, ${anzahlDateien} Dateien).`);
   }catch(e){console.error("exportKomplett",e);toast("Sicherung fehlgeschlagen: "+(e&&e.message||e));}}
+/* Schlüssel aus Sicherungs-Passwort ableiten (getrennt vom App-Passwort) */
+async function backupKey(pw,salt){const base=await crypto.subtle.importKey("raw",enc.encode(pw),"PBKDF2",false,["deriveKey"]);
+  return crypto.subtle.deriveKey({name:"PBKDF2",salt,iterations:150000,hash:"SHA-256"},base,{name:"AES-GCM",length:256},false,["encrypt","decrypt"]);}
+async function exportKomplettVerschluesselt(){
+  const pw=prompt("Passwort für diese verschlüsselte Sicherung festlegen (mind. 6 Zeichen).\n\nMerke es dir gut: Ohne dieses Passwort lässt sich die Datei NICHT wiederherstellen.");
+  if(pw===null)return;if(pw.length<6){toast("Mindestens 6 Zeichen.");return;}
+  const pw2=prompt("Zur Sicherheit bitte dasselbe Passwort noch einmal eingeben:");
+  if(pw2===null)return;if(pw!==pw2){toast("Die Passwörter stimmen nicht überein.");return;}
+  toast("Sammle und verschlüssele …");
+  try{const {clean,anzahlDateien}=await sammleKomplett();
+    const salt=crypto.getRandomValues(new Uint8Array(16));const iv=crypto.getRandomValues(new Uint8Array(12));
+    const key=await backupKey(pw,salt);
+    const ct=await crypto.subtle.encrypt({name:"AES-GCM",iv},key,enc.encode(JSON.stringify(clean)));
+    const out={__encrypted:true,v:1,salt:b64(salt),iv:b64(iv),ct:b64(ct)};
+    ladeHerunter(JSON.stringify(out),"praxis-cockpit-verschluesselt-"+today()+".pcbackup");
+    toast(`Verschlüsselte Sicherung gespeichert (${STATE.klienten.length} Klient:innen, ${anzahlDateien} Dateien).`);
+  }catch(e){console.error("exportVerschluesselt",e);toast("Sicherung fehlgeschlagen: "+(e&&e.message||e));}}
 function importJson(ev){const f=ev.target.files[0];if(!f)return;const r=new FileReader();
-  r.onload=async()=>{try{const d=JSON.parse(r.result);if(!d.klienten)throw 0;
+  r.onload=async()=>{try{let d=JSON.parse(r.result);
+    // Verschlüsselte Sicherung? Passwort erfragen und entschlüsseln
+    if(d&&d.__encrypted){const pw=prompt("Diese Sicherung ist verschlüsselt. Bitte das Sicherungs-Passwort eingeben:");
+      if(pw===null){toast("Abgebrochen.");return;}
+      try{const key=await backupKey(pw,unb64(d.salt));
+        const pt=await crypto.subtle.decrypt({name:"AES-GCM",iv:unb64(d.iv)},key,unb64(d.ct));
+        d=JSON.parse(dec.decode(pt));}
+      catch(e){toast("Falsches Passwort oder Datei beschädigt.");return;}}
+    if(!d.klienten)throw 0;
     const files=d.__files;delete d.__files;delete d.__komplett;
     STATE=Object.assign(DEFAULTS(),d);
-    if(!STATE.vorlagen.length)STATE.vorlagen=defaultVorlagen();migrateSettings();STATE.klienten.forEach(migrate);
-    // Dateien wiederherstellen (verschlüsselt in IndexedDB ablegen unter derselben fid)
+    if(!STATE.vorlagen.length)STATE.vorlagen=defaultVorlagen();try{migrateSettings();}catch(e){}STATE.klienten.forEach(migrate);
     if(files){let n=0;for(const fid of Object.keys(files)){try{const blob=await dataUrlToBlob(files[fid].data,files[fid].type);
       await txSet("files",fid,await encBlob(blob));n++;}catch(e){}}
       urlCache={};logoDataUrl=null;await save();toast(`Wiederhergestellt inkl. ${n} Dateien.`);}
-    else{await save();toast("Texte wiederhergestellt (keine Fotos in dieser Datei).");}
+    else{await save();toast("Wiederhergestellt.");}
     go("overview");}catch(e){toast("Datei nicht lesbar.");}};
   r.readAsText(f);}
 function dataUrlToBlob(dataUrl,type){return fetch(dataUrl).then(r=>r.blob());}
@@ -2020,7 +2055,6 @@ function escapeAttr(s){return escapeHtml(s);}
 let toastTimer=null;
 function toast(m){const t=$("#toast");t.textContent=m;t.classList.add("show");clearTimeout(toastTimer);toastTimer=setTimeout(()=>t.classList.remove("show"),2600);}
 
-/* App installierbar + offline: Service Worker registrieren (nur unter http/https, nicht bei file://) */
 if("serviceWorker" in navigator && location.protocol.startsWith("http")){
   window.addEventListener("load",()=>{navigator.serviceWorker.register("sw.js").catch(e=>console.warn("SW",e));});}
 boot();
